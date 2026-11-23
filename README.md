@@ -20,6 +20,20 @@ One command. About a minute and a half. No speakers used.
 
 <!-- demo video: drag an .mp4 here in GitHub's editor -->
 
+## Shared-surface instrument extension
+
+This checkout adds triangle/string and circle/drum instruments on the same trackpad,
+with finger-controlled vibrato and a silent touch counter.
+
+```sh
+./build.sh
+./nospeaker --instruments
+./nospeaker --touch-test
+```
+
+See [INSTRUMENTS.md](INSTRUMENTS.md) for playing instructions, architecture,
+MacBook touch-count research, and validation limits.
+
 ## 01 / before you start
 
 ```text

@@ -222,22 +222,50 @@ func speakersMuted() -> Bool? {
 struct Contact { var down = false; var x: Float = 0; var y: Float = 0; var size: Float = 0 }
 var touchLock = os_unfair_lock()
 var currentContact = Contact()
+var collectInstrumentFrames = false
+var instrumentFrames: [InstrumentFrame] = []
+var instrumentFramesOverflowed = false
+func drainInstrumentFrames() -> (frames: [InstrumentFrame], overflowed: Bool) {
+    os_unfair_lock_lock(&touchLock); defer { os_unfair_lock_unlock(&touchLock) }
+    let result = (instrumentFrames, instrumentFramesOverflowed)
+    instrumentFrames.removeAll(keepingCapacity: true)
+    instrumentFramesOverflowed = false
+    return result
+}
 var contact: Contact {
     os_unfair_lock_lock(&touchLock); defer { os_unfair_lock_unlock(&touchLock) }
     return currentContact
 }
 let touchCallback: FrameCallback = { _, data, count, _, _ in
     var best = Contact()
-    if let data, count > 0 {
+    var contacts: [InstrumentContact] = []
+    // This is the same undocumented 96-byte layout used upstream. The identifier
+    // at byte 16 is stable across frames; the record's array index is not.
+    if let data, count > 0, count <= 32 {
         for i in 0..<Int(count) {
             let rec = data.advanced(by: i * 96)
             let state = rec.load(fromByteOffset: 20, as: Int32.self)
             guard (3...5).contains(state) else { continue }
             best = Contact(down: true, x: rec.load(fromByteOffset: 32, as: Float.self),
                            y: rec.load(fromByteOffset: 36, as: Float.self), size: rec.load(fromByteOffset: 48, as: Float.self))
+            // State 5 is break-touch: preserve upstream's legacy contact handling,
+            // but release instrument ownership immediately on this frame.
+            if state != 5 {
+                contacts.append(InstrumentContact(id: rec.load(fromByteOffset: 16, as: Int32.self),
+                                                   x: Double(best.x), y: Double(best.y)))
+            }
         }
     }
-    os_unfair_lock_lock(&touchLock); currentContact = best; os_unfair_lock_unlock(&touchLock)
+    os_unfair_lock_lock(&touchLock)
+    currentContact = best
+    if collectInstrumentFrames {
+        if instrumentFrames.count >= 256 {
+            instrumentFrames.removeAll(keepingCapacity: true)
+            instrumentFramesOverflowed = true
+        }
+        instrumentFrames.append(InstrumentFrame(time: now(), contacts: contacts))
+    }
+    os_unfair_lock_unlock(&touchLock)
     return 0
 }
 /// Only the trackpad whose motor we opened.
@@ -447,9 +475,12 @@ func voiceTones(_ f: Frame) -> [(hz: Double, amp: Double)] {
 
 // MARK: - Live state shared with the screen
 
-enum Scene { case intro, heart, sweep, talk, sing, beat, rap, yourTurn, touch, say, outro }
+enum Scene { case intro, heart, sweep, talk, sing, beat, rap, yourTurn, touch, instruments, say, outro }
 
 struct LiveState {
+    var instrumentVoices: [InstrumentVoice] = []
+    var instrumentTouchCount = 0, instrumentPeakTouches = 0
+    var touchMonitorOnly = false
     var scene: Scene = .intro
     var part = 1
     var partName = "LOADING"
@@ -720,6 +751,84 @@ func noteName(_ f: Double) -> String {
     let names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
     let midi = Int((69 + 12 * log2(f / 440)).rounded())
     return names[(midi % 12 + 12) % 12] + String(midi / 12 - 1)
+}
+
+/// A continuous, shared-surface instrument. Every contact frame is queued so a
+/// short drum tap between synthesis ticks still creates an attack.
+func runInstruments(visuals: Bool, monitorOnly: Bool) {
+    if visuals { takeTerminal() }
+    defer { if visuals { restoreTerminal() } }
+    os_unfair_lock_lock(&touchLock)
+    collectInstrumentFrames = true
+    os_unfair_lock_unlock(&touchLock)
+    guard startTouch() else { fail("This Mac cannot start raw multitouch tracking.") }
+    defer {
+        stopTouch()
+        os_unfair_lock_lock(&touchLock)
+        collectInstrumentFrames = false
+        instrumentFrames.removeAll()
+        os_unfair_lock_unlock(&touchLock)
+    }
+    if !visuals {
+        print(monitorOnly ? "Touch monitor (silent). Put fingers on the trackpad; Ctrl-C to stop." :
+            "Triangle = string fretboard; other touches = bass drum. Slide for notes; rock for vibrato. Ctrl-C to stop.")
+    }
+    var engine = InstrumentEngine()
+    var state = LiveState()
+    state.scene = .instruments
+    state.touchMonitorOnly = monitorOnly
+    let canvas = Canvas()
+    var nextDraw = 0.0, lastReport = -1, lastSize = (w: 0, h: 0)
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
+    while !interrupted() {
+        let tick = now()
+        let batch = drainInstrumentFrames()
+        if batch.overflowed { engine.reset() }
+        for frame in batch.frames { engine.accept(frame) }
+        engine.prune(at: tick)
+        let mix = engine.mix(at: tick)
+        if !monitorOnly && !mix.tones.isEmpty {
+            play(mix.tones, ms: 10, level: mix.level)
+        }
+        if visuals && tick >= nextDraw {
+            state.instrumentVoices = engine.held.values.sorted { $0.contact.id < $1.contact.id }
+            state.instrumentTouchCount = engine.touchCount
+            state.instrumentPeakTouches = engine.peakTouches
+            let size = terminalSize()
+            if size != lastSize { out(fillScreen()); canvas.shown = nil; lastSize = size }
+            if size.w < 80 || size.h < 24 {
+                out("\u{1B}[1;1HResize to 80 x 24 to see instruments. q to exit.")
+            } else {
+                draw(canvas, state, tick)
+                out(canvas.changes(originX: max(0, (size.w - 80) / 2), originY: max(0, (size.h - 24) / 2)))
+            }
+            nextDraw = tick + 1.0 / 30
+        } else if !visuals && engine.touchCount != lastReport {
+            print("contacts: \(engine.touchCount) | peak observed: \(engine.peakTouches)")
+            fflush(stdout)
+            lastReport = engine.touchCount
+        }
+        if visuals && waitForInput(ms: 0) {
+            var key: UInt8 = 0
+            if read(STDIN_FILENO, &key, 1) == 1 {
+                if key == 113 || key == 81 { break }
+                if key == 27 {
+                    if !waitForInput(ms: 5) { break }
+                    // Discard mouse/arrow escape sequences generated by Terminal.
+                    var byte: UInt8 = 0
+                    if read(STDIN_FILENO, &byte, 1) == 1, byte == 91 || byte == 79 {
+                        while waitForInput(ms: 5), read(STDIN_FILENO, &byte, 1) == 1 {
+                            if (0x40...0x7E).contains(byte) { break }
+                        }
+                    }
+                }
+            }
+        }
+        let remaining = tick + 0.01 - now()
+        if remaining > 0 { usleep(useconds_t(remaining * 1e6)) }
+    }
+    if visuals { restoreTerminal() }
+    print("Peak observed: \(engine.peakTouches) simultaneous contacts on \(macModel()). This is an observed count, not a hardware limit.")
 }
 
 /// A sparkle to close: an arpeggio up, then the motor's purest note.
@@ -994,6 +1103,7 @@ func remember(_ s: LiveState, _ t: Double) {
 
 func draw(_ cv: Canvas, _ s: LiveState, _ t: Double) {
     cv.clear()
+    if s.scene == .instruments { drawInstruments(cv, s, t); return }
     // "a90.com presents", framed by rules.
     let presents = "a90.com presents"
     let width = logoWidth, side = (width - presents.count - 4) / 2
@@ -1244,6 +1354,57 @@ func drawTouch(_ cv: Canvas, _ s: LiveState, _ t: Double) {
         cv.text(rx, 19, asciiBar(left / 12, width: 22), inkC)
         cv.text(rx + 22, 19, String(format: "%2.0fs", left), dimC)
     }
+}
+
+func drawInstruments(_ cv: Canvas, _ s: LiveState, _ t: Double) {
+    cv.centered(0, s.touchMonitorOnly ? "N O  S P E A K E R   /   T O U C H  M O N I T O R" :
+        "N O  S P E A K E R   /   S H A R E D  S U R F A C E", inkC, bold: true)
+    cv.centered(2, s.touchMonitorOnly ? "Silent diagnostic / every marker is an independent contact" :
+        "First touch: triangle / string     Other touches: circle / bass drum", bodyC)
+    let left = 3, top = 4, width = 74, height = 14
+    cv.text(left, top, "╭" + String(repeating: "─", count: width - 2) + "╮", midC)
+    cv.text(left, top + height - 1, "╰" + String(repeating: "─", count: width - 2) + "╯", midC)
+    for y in (top + 1)..<(top + height - 1) {
+        cv.put(left, y, "│", midC); cv.put(left + width - 1, y, "│", midC)
+    }
+    if !s.touchMonitorOnly {
+        let count = Double(InstrumentFretboard.notes.count)
+        let activeFret = s.instrumentVoices.first { $0.kind == .string }?.fretIndex
+        for index in InstrumentFretboard.notes.indices {
+            if index > 0 {
+                let x = left + 4 + Int(Double(index) / count * Double(width - 9))
+                for y in (top + 1)..<(top + height - 1) { cv.put(x, y, "·", faintC) }
+            }
+            let x = left + 4 + Int((Double(index) + 0.5) / count * Double(width - 9)) - 1
+            cv.text(x, 18, noteName(InstrumentFretboard.frequency(at: index)),
+                    activeFret == index ? inkC : dimC, bold: activeFret == index)
+        }
+    }
+    if s.instrumentVoices.isEmpty {
+        cv.centered(10, "Touch anywhere. This whole surface belongs to every instrument.", dimC)
+    }
+    for voice in s.instrumentVoices {
+        let x = left + 4 + Int(voice.contact.x * Double(width - 9))
+        let y = top + 2 + Int((1 - voice.contact.y) * Double(height - 6))
+        let color = voice.kind == .string || t - voice.began < 0.12 ? inkC : midC
+        if voice.kind == .string && !s.touchMonitorOnly {
+            cv.text(x - 1, y - 1, "/\\", color, bold: true)
+            cv.text(x - 2, y, "/__\\", color, bold: true)
+        } else {
+            cv.text(x - 2, y - 1, ".--.", color)
+            cv.text(x - 2, y, "(  )", color)
+            cv.text(x - 2, y + 1, "'--'", color)
+        }
+        cv.text(x - 2, y + 2, "#\(voice.contact.id)", color)
+    }
+    cv.text(3, 19, "contacts \(s.instrumentTouchCount)   peak observed \(s.instrumentPeakTouches)", inkC, bold: true)
+    if let string = s.instrumentVoices.first(where: { $0.kind == .string }), !s.touchMonitorOnly {
+        cv.text(40, 19, String(format: "%@  %+.0f cents", noteName(string.baseHz), string.bendCents), inkC)
+    }
+    cv.centered(21, s.touchMonitorOnly ? "Try all ten fingers. Peak observed is not a guaranteed device maximum." :
+        "Slide left/right to change notes. Small rocking adds vibrato. Lift to release.", bodyC)
+    cv.centered(22, s.touchMonitorOnly ? "No motor actuation in this mode. q / esc / ctrl-c to exit." :
+        "Keep the string held; tap another finger to drum. q / esc / ctrl-c to exit.", midC)
 }
 
 func drawSay(_ cv: Canvas, _ s: LiveState, _ t: Double) {
@@ -1533,6 +1694,8 @@ if flag("--help") || flag("-h") {
       nospeaker                         the show (space skips a part, q goes to the end)
       nospeaker "any words"             just say something
       nospeaker --sweep                 a rising tone, 100 Hz to 4 kHz
+      nospeaker --instruments           triangle strings + circle drums, shared trackpad
+      nospeaker --touch-test            silent live contact counter (observed peak)
       --voice Daniel                    any voice from `say -v '?'`
       --dark                            white on black instead of black on white
       --plain                           no visuals
@@ -1550,16 +1713,44 @@ if let v = voiceName, !voiceExists(v) {
 applyTheme(light: !flag("--dark"))
 let plain = flag("--plain")
 let wantsSweep = flag("--sweep")
+let wantsInstruments = flag("--instruments")
+let wantsTouchTest = flag("--touch-test")
+if (wantsInstruments || wantsTouchTest) && (wantsSweep || !args.isEmpty || (wantsInstruments && wantsTouchTest)) {
+    usageError("Use --instruments or --touch-test on its own (with optional --dark / --plain).")
+}
 if let unknown = args.first(where: { $0.hasPrefix("-") }) { usageError("\"\(unknown)\" isn't an option.") }
 
 signal(SIGINT) { _ in requestEnd() }
 signal(SIGTERM) { _ in stopRequested = true }
 atexit { restoreTerminal() }
 
-motor = openMotor()
-motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
+if wantsTouchTest {
+    // A diagnostic must not require opening or driving the haptic actuator.
+    guard let list = createList?()?.takeRetainedValue(), CFArrayGetCount(list) > 0, let getID else {
+        fail("No multitouch device is available to monitor.")
+    }
+    deviceList = list
+    var selected = false
+    for i in 0..<CFArrayGetCount(list) {
+        guard let raw = CFArrayGetValueAtIndex(list, i) else { continue }
+        let device = UnsafeMutableRawPointer(mutating: raw)
+        var id: UInt64 = 0
+        guard getID(device, &id) == 0 else { continue }
+        if !selected || (isBuiltIn?(device) ?? false) {
+            motorDeviceID = id; selected = true
+            if isBuiltIn?(device) ?? false { break }
+        }
+    }
+    if !selected { fail("Could not identify a multitouch device.") }
+} else {
+    motor = openMotor()
+    motorPointer = Unmanaged.passUnretained(motor! as AnyObject).toOpaque()
+}
 
-if wantsSweep || !args.isEmpty {
+if wantsInstruments || wantsTouchTest {
+    let visuals = !plain && isatty(STDOUT_FILENO) == 1 && isatty(STDIN_FILENO) == 1
+    runInstruments(visuals: visuals, monitorOnly: wantsTouchTest)
+} else if wantsSweep || !args.isEmpty {
     pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0)
     if wantsSweep { print("sweeping 100 Hz → 4 kHz…"); sweep(seconds: 5) }
     if !args.isEmpty {

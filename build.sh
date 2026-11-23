@@ -31,11 +31,14 @@ if [ -z "$1" ] || [ "$1" -lt 5 ] || { [ "$1" -eq 5 ] && [ "$2" -lt 7 ]; }; then
 fi
 
 mkdir -p build
+# Swift requires the entry point to be named main.swift in a multi-file build.
+cp nospeaker.swift build/main.swift
+export CLANG_MODULE_CACHE_PATH="$PWD/build/module-cache"
 echo "building for Apple Silicon…"
-swiftc -O -target arm64-apple-macos12 nospeaker.swift -o build/nospeaker-arm64 \
+swiftc -O -target arm64-apple-macos12 build/main.swift InstrumentEngine.swift -o build/nospeaker-arm64 \
     || fail "the Apple Silicon build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
 echo "building for Intel…"
-swiftc -O -target x86_64-apple-macos13 nospeaker.swift -o build/nospeaker-x86_64 \
+swiftc -O -target x86_64-apple-macos13 build/main.swift InstrumentEngine.swift -o build/nospeaker-x86_64 \
     || fail "the Intel build failed (errors above). Make sure Xcode or the Command Line Tools are up to date."
 
 lipo -create build/nospeaker-arm64 build/nospeaker-x86_64 -output build/nospeaker
