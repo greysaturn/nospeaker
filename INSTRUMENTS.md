@@ -15,6 +15,12 @@ Use a terminal at least 80 columns by 24 rows. `--dark` selects a dark backgroun
 `--plain` prints contact counts without shapes. Exit with `q`, Escape, or Ctrl-C
 (in plain mode, use Ctrl-C).
 
+Instrument mode applies a 2× output gain to bring up sustained notes and drum
+tails for recording, with the final actuator level still capped at 1.0. Peaks
+already at the cap cannot get louder. This is an increase in the commanded drive
+level, not a measured doubling of acoustic loudness. Restart a running instance
+after rebuilding to use the updated level.
+
 1. Place one finger anywhere: a triangle appears at its trackpad position and
    plays a string-like synthesized voice. Horizontal position chooses a note
    from the same G3–D5 layout, now shown as a labeled fretboard. Slide left or

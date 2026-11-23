@@ -57,6 +57,9 @@ struct InstrumentMix {
 
 /// Pure state/synthesis layer: no hardware, terminal, or wall-clock dependencies.
 struct InstrumentEngine {
+    // Boost quieter notes and drum tails for recording; the final limiter still
+    // caps the actuator at its existing maximum. Tone ratios stay unchanged.
+    private let outputGain = 2.0
     private(set) var held: [Int32: InstrumentVoice] = [:]
     private(set) var tails: [InstrumentVoice] = []
     private(set) var peakTouches = 0
@@ -154,6 +157,6 @@ struct InstrumentEngine {
         tones = tones.filter { $0.amp > 0.0001 && (100...4000).contains($0.hz) }
         let sum = tones.reduce(0) { $0 + $1.amp }
         // play() normalizes tone weights; carry the envelope in overall level.
-        return InstrumentMix(tones: tones, level: Float(min(1, sum)))
+        return InstrumentMix(tones: tones, level: Float(min(1, sum * outputGain)))
     }
 }
